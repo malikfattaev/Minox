@@ -108,8 +108,14 @@ struct FileState: Codable {
     var carry: Int = 0
 }
 
+struct CodexWindowState: Codable {
+    var percent: Double
+    var resetsAt: Double?
+    var epoch: Int
+}
+
 struct Cache: Codable {
-    var version = 2
+    var version = 3
     var files: [String: FileState] = [:]
     var claude = HourBuckets()
     var codex = HourBuckets()
@@ -117,38 +123,45 @@ struct Cache: Codable {
     /// чтобы цепочка 5-часовых блоков успела переякориться на паузе в работе.
     var claudeMinutes: [Int: Int] = [:]
     var ids = Data()
-    var codexPercent: Double?
-    var codexResetsAt: Double?
-    var codexLimitEpoch: Int = 0
+    /// window_minutes → свежее состояние этого окна.
+    var codexWindows: [Int: CodexWindowState] = [:]
 
     var result: ScanResult {
         var out = ScanResult()
         out.claude = claude
         out.codex = codex
         out.claudeMinutes = claudeMinutes
-        if let percent = codexPercent {
+        // Codex чередует, какое окно кладёт в primary: то 5-часовое, то недельное.
+        // Брать последнее пришедшее нельзя — процент скачет между ними.
+        // Показываем самое жёсткое из известных.
+        if let worst = codexWindows.values.max(by: { $0.percent < $1.percent }) {
             out.codexLimit = CodexLimit(
-                usedPercent: percent,
-                resetsAt: codexResetsAt.map { Date(timeIntervalSince1970: $0) }
+                usedPercent: worst.percent,
+                resetsAt: worst.resetsAt.map { Date(timeIntervalSince1970: $0) }
             )
         }
         return out
     }
 
-    /// Держим самую свежую запись о лимитах.
+    /// Свежее состояние каждого окна храним отдельно, а не одно последнее.
     mutating func noteCodexLimit(_ limits: [String: Any], at epoch: Int) {
-        guard epoch >= codexLimitEpoch,
-              let primary = limits["primary"] as? [String: Any],
-              let percent = (primary["used_percent"] as? NSNumber)?.doubleValue
-        else { return }
-        codexLimitEpoch = epoch
-        codexPercent = percent
-        codexResetsAt = (primary["resets_at"] as? NSNumber)?.doubleValue
+        for key in ["primary", "secondary"] {
+            guard let window = limits[key] as? [String: Any],
+                  let minutes = (window["window_minutes"] as? NSNumber)?.intValue,
+                  let percent = (window["used_percent"] as? NSNumber)?.doubleValue
+            else { continue }
+            if let known = codexWindows[minutes], known.epoch > epoch { continue }
+            codexWindows[minutes] = CodexWindowState(
+                percent: percent,
+                resetsAt: (window["resets_at"] as? NSNumber)?.doubleValue,
+                epoch: epoch
+            )
+        }
     }
 
     /// Файл усох или исчез — значит логи переписали, инкремент больше не сходится.
     func needsRebuild(against present: [String]) -> Bool {
-        if version != 2 { return true }
+        if version != 3 { return true }
         let existing = Set(present)
         for (path, state) in files {
             guard existing.contains(path) else { return true }
