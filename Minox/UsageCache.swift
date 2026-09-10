@@ -115,7 +115,7 @@ struct CodexWindowState: Codable {
 }
 
 struct Cache: Codable {
-    var version = 3
+    var version = 4
     var files: [String: FileState] = [:]
     var claude = HourBuckets()
     var codex = HourBuckets()
@@ -123,18 +123,23 @@ struct Cache: Codable {
     /// чтобы цепочка 5-часовых блоков успела переякориться на паузе в работе.
     var claudeMinutes: [Int: Int] = [:]
     var ids = Data()
-    /// window_minutes → свежее состояние этого окна.
-    var codexWindows: [Int: CodexWindowState] = [:]
+    /// Codex ведёт несколько независимых наборов лимитов и различает их по
+    /// limit_id: общий, отдельный на Codex-Spark и так далее. Внутри набора
+    /// окна ещё и разной длины, поэтому ключ — пара limit_id и длины окна.
+    /// По одной длине наборы затирали бы друг друга.
+    var codexWindows: [String: CodexWindowState] = [:]
 
     var result: ScanResult {
         var out = ScanResult()
         out.claude = claude
         out.codex = codex
         out.claudeMinutes = claudeMinutes
-        // Codex чередует, какое окно кладёт в primary: то 5-часовое, то недельное.
-        // Брать последнее пришедшее нельзя — процент скачет между ними.
-        // Показываем самое жёсткое из известных.
-        if let worst = codexWindows.values.max(by: { $0.percent < $1.percent }) {
+        // Показываем самый жёсткий из действующих лимитов — упрётся он первым.
+        // Окна, чьё время сброса уже прошло, в расчёт не берём.
+        let now = Date().timeIntervalSince1970
+        if let worst = codexWindows.values
+            .filter({ ($0.resetsAt ?? .greatestFiniteMagnitude) > now })
+            .max(by: { $0.percent < $1.percent }) {
             out.codexLimit = CodexLimit(
                 usedPercent: worst.percent,
                 resetsAt: worst.resetsAt.map { Date(timeIntervalSince1970: $0) }
@@ -145,13 +150,15 @@ struct Cache: Codable {
 
     /// Свежее состояние каждого окна храним отдельно, а не одно последнее.
     mutating func noteCodexLimit(_ limits: [String: Any], at epoch: Int) {
+        let limitID = limits["limit_id"] as? String ?? "default"
         for key in ["primary", "secondary"] {
             guard let window = limits[key] as? [String: Any],
                   let minutes = (window["window_minutes"] as? NSNumber)?.intValue,
                   let percent = (window["used_percent"] as? NSNumber)?.doubleValue
             else { continue }
-            if let known = codexWindows[minutes], known.epoch > epoch { continue }
-            codexWindows[minutes] = CodexWindowState(
+            let id = "\(limitID)|\(minutes)"
+            if let known = codexWindows[id], known.epoch > epoch { continue }
+            codexWindows[id] = CodexWindowState(
                 percent: percent,
                 resetsAt: (window["resets_at"] as? NSNumber)?.doubleValue,
                 epoch: epoch
@@ -161,7 +168,7 @@ struct Cache: Codable {
 
     /// Файл усох или исчез — значит логи переписали, инкремент больше не сходится.
     func needsRebuild(against present: [String]) -> Bool {
-        if version != 3 { return true }
+        if version != 4 { return true }
         let existing = Set(present)
         for (path, state) in files {
             guard existing.contains(path) else { return true }
