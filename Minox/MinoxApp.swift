@@ -25,6 +25,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var outsideClickMonitor: Any?
     private var isClosing = false
     private let store = UsageStore()
+    private var footer: NSHostingView<FooterCard>!
+    private var container: NSView!
+    private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         store.refresh()
@@ -39,16 +42,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         icon?.isTemplate = true
         statusItem.button?.image = icon
         statusItem.button?.target = self
-        statusItem.button?.action = #selector(handleClick)
-        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        statusItem.button?.action = #selector(togglePanel)
 
-        // NSGlassEffectView под контентом прямоугольный по bounds — режем по слою,
-        // иначе в углах торчит квадратная подложка.
-        hosting = NSHostingView(rootView: UsagePopover(store: store))
-        hosting.wantsLayer = true
-        hosting.layer?.cornerRadius = Metrics.cornerRadius
-        hosting.layer?.cornerCurve = .continuous
-        hosting.layer?.masksToBounds = true
+        hosting = makeCard(UsagePopover(store: store))
+        footer = makeCard(FooterCard(
+            onSettings: { [weak self] in self?.showSettings() },
+            onQuit: { NSApp.terminate(nil) }
+        ))
+        container = NSView()
+        container.addSubview(hosting)
+        container.addSubview(footer)
 
         panel = PopoverPanel(
             contentRect: NSRect(x: 0, y: 0, width: Metrics.popoverWidth, height: Metrics.popoverWidth),
@@ -56,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             backing: .buffered,
             defer: false
         )
-        panel.contentView = hosting
+        panel.contentView = container
         panel.delegate = self
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -92,37 +95,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
-    @objc private func handleClick() {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            showMenu()
-        } else {
-            (panel.isVisible && !isClosing) ? closePanel() : openPanel()
-        }
+    @objc private func togglePanel() {
+        (panel.isVisible && !isClosing) ? closePanel() : openPanel()
     }
 
-    /// Выйти можно только правым кликом по иконке — поповер оставляем чистым.
-    private func showMenu() {
+    /// NSGlassEffectView под контентом прямоугольный по bounds, поэтому каждую
+    /// карточку скругляем на уровне слоя — SwiftUI-шейп его не обрезает.
+    private func makeCard<V: View>(_ view: V) -> NSHostingView<V> {
+        let card = NSHostingView(rootView: view)
+        card.wantsLayer = true
+        card.layer?.cornerRadius = Metrics.cornerRadius
+        card.layer?.cornerCurve = .continuous
+        card.layer?.masksToBounds = true
+        return card
+    }
+
+    /// Раскладываем карточки снизу вверх: у AppKit начало координат внизу.
+    private func layoutCards() -> NSSize {
+        let top = hosting.fittingSize
+        let bottom = footer.fittingSize
+        let width = max(top.width, bottom.width)
+        let total = NSSize(width: width, height: top.height + Metrics.cardGap + bottom.height)
+
+        container.frame = NSRect(origin: .zero, size: total)
+        footer.frame = NSRect(x: 0, y: 0, width: width, height: bottom.height)
+        hosting.frame = NSRect(x: 0, y: bottom.height + Metrics.cardGap, width: width, height: top.height)
+        return total
+    }
+
+    private func showSettings() {
         closePanel()
-        let menu = NSMenu()
-        let launch = NSMenuItem(title: "Open at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
-        launch.target = self
-        launch.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(launch)
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Quit Minox", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
-        if let button = statusItem.button {
-            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 5), in: button)
-        }
-    }
+        if settingsWindow == nil {
+            let size = NSSize(width: 720, height: 460)
+            let window = NSWindow(
+                contentRect: NSRect(origin: .zero, size: size),
+                styleMask: [.titled, .closable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false
+            )
+            window.title = "Minox"
+            window.titlebarAppearsTransparent = true
+            window.contentView = NSHostingView(rootView: SettingsView(store: store))
+            window.isReleasedWhenClosed = false
 
-    @objc private func toggleLoginItem() {
-        let service = SMAppService.mainApp
-        do {
-            service.status == .enabled ? try service.unregister() : try service.register()
-        } catch {
-            NSLog("Minox: не удалось переключить автозапуск — \(error.localizedDescription)")
+            // window.center() ставит окно выше середины — центрируем сами.
+            if let screen = NSScreen.main?.visibleFrame {
+                window.setFrameOrigin(NSPoint(
+                    x: (screen.midX - size.width / 2).rounded(),
+                    y: (screen.midY - size.height / 2).rounded()
+                ))
+            }
+            settingsWindow = window
         }
+
+        // Политика .accessory не даёт окну фокус сама по себе.
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
     }
 
     private func openPanel() {
@@ -130,7 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         store.refreshIfStale()
 
-        let size = hosting.fittingSize
+        let size = layoutCards()
         panel.setContentSize(size)
 
         // Центрируем панель ровно по центру кнопки в меню-баре.
@@ -207,6 +236,7 @@ final class PopoverPanel: NSPanel {
 private enum Metrics {
     static let popoverWidth: CGFloat = 238
     static let cornerRadius: CGFloat = 16
+    static let cardGap: CGFloat = 8
     static let horizontalPadding: CGFloat = 16
     static let panelGap: CGFloat = 8
     static let appearOffset: CGFloat = 8
@@ -273,6 +303,208 @@ struct UsagePopover: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Нижняя карточка
+
+struct FooterCard: View {
+    let onSettings: () -> Void
+    let onQuit: () -> Void
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: Metrics.cornerRadius, style: .continuous)
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            FooterButton(title: "Settings", action: onSettings)
+            Spacer(minLength: 8)
+            FooterButton(title: "Quit", action: onQuit)
+        }
+        .padding(.horizontal, Metrics.horizontalPadding)
+        .padding(.vertical, 13)
+        .frame(width: Metrics.popoverWidth)
+        .modifier(GlassSurface(shape: shape))
+        .clipShape(shape)
+        .preferredColorScheme(.dark)
+    }
+}
+
+private struct FooterButton: View {
+    let title: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.white.opacity(hovering ? 1 : 0.75))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) { self.hovering = hovering }
+        }
+    }
+}
+
+// MARK: - Настройки
+
+private enum SettingsSection: String, CaseIterable, Identifiable {
+    case general, claude, codex
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .claude: return "Claude"
+        case .codex: return "Codex"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .general: return "gearshape"
+        case .claude: return "asterisk"
+        case .codex: return "chevron.left.forwardslash.chevron.right"
+        }
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var store: UsageStore
+    @State private var section: SettingsSection? = .general
+
+    var body: some View {
+        NavigationSplitView {
+            List(selection: $section) {
+                ForEach(SettingsSection.allCases) { item in
+                    Label(item.title, systemImage: item.icon).tag(item)
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+        } detail: {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    switch section ?? .general {
+                    case .general: GeneralPane()
+                    case .claude: ClaudePane(stats: store.claude)
+                    case .codex: CodexPane(stats: store.codex)
+                    }
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .navigationTitle(section?.title ?? "General")
+    }
+}
+
+// MARK: Разделы настроек
+
+private struct GeneralPane: View {
+    @State private var openAtLogin = SMAppService.mainApp.status == .enabled
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            SettingsCard {
+                HStack {
+                    Text("Open at Login").font(.system(size: 13))
+                    Spacer(minLength: 12)
+                    Toggle("", isOn: Binding(
+                        get: { openAtLogin },
+                        // Показываем то, что реально ответила система, а не желаемое.
+                        set: { wanted in
+                            setLoginItem(wanted)
+                            openAtLogin = SMAppService.mainApp.status == .enabled
+                        }
+                    ))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                }
+            }
+        }
+    }
+
+    private func setLoginItem(_ enabled: Bool) {
+        do {
+            enabled ? try SMAppService.mainApp.register() : try SMAppService.mainApp.unregister()
+        } catch {
+            NSLog("Minox: не удалось переключить автозапуск — \(error.localizedDescription)")
+        }
+    }
+}
+
+private struct ClaudePane: View {
+    let stats: ProviderStats
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            SettingsCard {
+                SourceRow(
+                    title: "Лимит",
+                    value: stats.limitIsReported ? "Точный, из API аккаунта" : "Оценка по логам этого мака",
+                    ok: stats.limitIsReported
+                )
+            }
+            SettingsCard {
+                SourceRow(title: "Токены", value: "~/.claude/projects", ok: stats.allTime > 0)
+            }
+        }
+    }
+}
+
+private struct CodexPane: View {
+    let stats: ProviderStats
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            SettingsCard {
+                SourceRow(
+                    title: "Лимит",
+                    value: stats.limitIsReported ? "Точный, из логов Codex" : "Нет данных",
+                    ok: stats.limitIsReported
+                )
+            }
+            SettingsCard {
+                SourceRow(title: "Токены", value: "~/.codex/sessions", ok: stats.allTime > 0)
+            }
+        }
+    }
+}
+
+// MARK: Мелочи настроек
+
+private struct SettingsCard<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+private struct SourceRow: View {
+    let title: String
+    let value: String
+    let ok: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                .foregroundStyle(ok ? Palette.ok : Palette.warn)
+            Text(title)
+            Spacer(minLength: 12)
+            Text(value)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.system(size: 13))
     }
 }
 
