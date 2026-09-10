@@ -44,8 +44,8 @@ def store(tokens: dict) -> None:
     blob = json.dumps(tokens)
     rc = subprocess.run(
         ["security", "add-generic-password", "-U",
-         "-s", KEYCHAIN_SERVICE, "-a", os.environ.get("USER", ""), "-w", blob],
-        capture_output=True, text=True,
+         "-s", KEYCHAIN_SERVICE, "-a", os.environ.get("USER", ""), "-w"],
+        input=blob + "\n" + blob + "\n", capture_output=True, text=True,
     ).returncode
     if rc != 0:
         sys.exit("не удалось записать в связку ключей")

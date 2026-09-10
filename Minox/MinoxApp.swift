@@ -144,6 +144,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Выезжает из-под меню-бара: стартуем чуть выше и гасим прозрачностью.
         isClosing = false
+        store.setPopoverVisible(true)
         let finalFrame = NSRect(origin: NSPoint(x: x.rounded(), y: y.rounded()), size: size)
         var startFrame = finalFrame
         startFrame.origin.y += Metrics.appearOffset
@@ -171,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func closePanel() {
         guard panel.isVisible, !isClosing else { return }
         isClosing = true
+        store.setPopoverVisible(false)
 
         if let monitor = outsideClickMonitor {
             NSEvent.removeMonitor(monitor)
@@ -259,7 +261,17 @@ struct UsagePopover: View {
         .frame(width: Metrics.popoverWidth)
         .modifier(GlassSurface(shape: shape))
         .clipShape(shape)
-        .onReceive(Timer.publish(every: 30, on: .main, in: .common).autoconnect()) { now = $0 }
+        .onChange(of: store.isPopoverVisible) { visible in
+            if visible { now = Date() }
+        }
+        .task(id: store.isPopoverVisible) {
+            guard store.isPopoverVisible else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                guard !Task.isCancelled, store.isPopoverVisible else { return }
+                now = Date()
+            }
+        }
         .preferredColorScheme(.dark)
     }
 }

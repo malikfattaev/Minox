@@ -20,22 +20,31 @@ final class CodexAccountUsageClient: @unchecked Sendable {
 
     private final class ResponseBuffer: @unchecked Sendable {
         private let lock = NSLock()
-        private var data = Data()
-        private var didSignal = false
+        private var partialLine = Data()
+        private var responses: [Int: Data] = [:]
 
-        func append(_ chunk: Data) -> Bool {
+        func append(_ chunk: Data) -> [Int] {
             lock.lock()
             defer { lock.unlock() }
-            data.append(chunk)
-            guard data.range(of: Data("\"id\":2,\"result\"".utf8)) != nil, !didSignal else { return false }
-            didSignal = true
-            return true
+
+            partialLine.append(chunk)
+            var ids: [Int] = []
+            while let newline = partialLine.firstIndex(of: 0x0A) {
+                let line = Data(partialLine[..<newline])
+                partialLine.removeSubrange(...newline)
+                guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                      let id = (object["id"] as? NSNumber)?.intValue
+                else { continue }
+                responses[id] = line
+                ids.append(id)
+            }
+            return ids
         }
 
-        var snapshot: Data {
+        func response(for id: Int) -> Data? {
             lock.lock()
             defer { lock.unlock() }
-            return data
+            return responses[id]
         }
     }
 
@@ -52,12 +61,19 @@ final class CodexAccountUsageClient: @unchecked Sendable {
         process.standardError = FileHandle.nullDevice
 
         let received = ResponseBuffer()
+        let initialized = DispatchSemaphore(value: 0)
         let responseReady = DispatchSemaphore(value: 0)
+        let terminated = DispatchSemaphore(value: 0)
+
+        process.terminationHandler = { _ in terminated.signal() }
 
         output.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
             guard !chunk.isEmpty else { return }
-            if received.append(chunk) { responseReady.signal() }
+            for id in received.append(chunk) {
+                if id == 1 { initialized.signal() }
+                if id == Self.responseID { responseReady.signal() }
+            }
         }
 
         do {
@@ -70,22 +86,39 @@ final class CodexAccountUsageClient: @unchecked Sendable {
                 ]
             ], to: input.fileHandleForWriting)
 
-            // app-server принимает initialized после завершения initialize.
-            Thread.sleep(forTimeInterval: 0.1)
+            guard initialized.wait(timeout: .now() + .seconds(5)) == .success else {
+                finish(process, input: input.fileHandleForWriting, terminated: terminated)
+                output.fileHandleForReading.readabilityHandler = nil
+                return nil
+            }
+
             try send(["method": "initialized", "params": [:]], to: input.fileHandleForWriting)
             try send(["method": "account/usage/read", "id": Self.responseID], to: input.fileHandleForWriting)
-            _ = responseReady.wait(timeout: .now() + .seconds(5))
+            guard responseReady.wait(timeout: .now() + .seconds(5)) == .success else {
+                finish(process, input: input.fileHandleForWriting, terminated: terminated)
+                output.fileHandleForReading.readabilityHandler = nil
+                return nil
+            }
         } catch {
+            finish(process, input: input.fileHandleForWriting, terminated: terminated)
             output.fileHandleForReading.readabilityHandler = nil
             return nil
         }
 
         output.fileHandleForReading.readabilityHandler = nil
-        try? input.fileHandleForWriting.close()
-        if process.isRunning { process.terminate() }
-        process.waitUntilExit()
+        finish(process, input: input.fileHandleForWriting, terminated: terminated)
 
-        return parse(received.snapshot)
+        guard let response = received.response(for: Self.responseID) else { return nil }
+        return parse(response)
+    }
+
+    private func finish(_ process: Process, input: FileHandle, terminated: DispatchSemaphore) {
+        try? input.close()
+        guard process.isRunning else { return }
+        if terminated.wait(timeout: .now() + .seconds(1)) == .timedOut, process.isRunning {
+            process.terminate()
+        }
+        if process.isRunning { process.waitUntilExit() }
     }
 
     private func executableURL() -> URL? {

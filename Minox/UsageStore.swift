@@ -20,6 +20,7 @@ final class UsageStore: ObservableObject {
     @Published private(set) var codex = ProviderStats()
     @Published private(set) var claude = ProviderStats()
     @Published private(set) var isScanning = false
+    @Published private(set) var isPopoverVisible = false
 
     /// Claude не публикует лимиты локально (cachedUsageUtilization в ~/.claude.json
     /// заморожен). Считаем сами и калибруем по /status: 132.7M токенов в блоке = 20%.
@@ -69,6 +70,10 @@ final class UsageStore: ObservableObject {
                 self?.apply(result, codexUsage: codexUsage, limits: limits)
             }
         }
+    }
+
+    func setPopoverVisible(_ visible: Bool) {
+        isPopoverVisible = visible
     }
 
     private func apply(
