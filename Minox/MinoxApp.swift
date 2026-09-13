@@ -21,11 +21,12 @@ enum Minox {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem!
     private var panel: PopoverPanel!
-    private var hosting: NSHostingView<UsagePopover>!
     private var outsideClickMonitor: Any?
     private var isClosing = false
     private let store = UsageStore()
-    private var footer: NSHostingView<FooterCard>!
+    private let timer = FocusTimer()
+    /// Карточки панели сверху вниз.
+    private var cards: [NSView] = []
     private var container: NSView!
     private var settingsWindow: NSWindow?
 
@@ -44,14 +45,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(togglePanel)
 
-        hosting = makeCard(UsagePopover(store: store))
-        footer = makeCard(FooterCard(
-            onSettings: { [weak self] in self?.showSettings() },
-            onQuit: { NSApp.terminate(nil) }
-        ))
+        cards = [
+            makeCard(UsagePopover(store: store)),
+            makeCard(FocusCard(timer: timer)),
+            makeCard(FooterCard(
+                onSettings: { [weak self] in self?.showSettings() },
+                onQuit: { NSApp.terminate(nil) }
+            ))
+        ]
         container = NSView()
-        container.addSubview(hosting)
-        container.addSubview(footer)
+        cards.forEach(container.addSubview)
 
         panel = PopoverPanel(
             contentRect: NSRect(x: 0, y: 0, width: Metrics.popoverWidth, height: Metrics.popoverWidth),
@@ -110,16 +113,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return card
     }
 
-    /// Раскладываем карточки снизу вверх: у AppKit начало координат внизу.
+    /// Раскладываем карточки сверху вниз, помня, что у AppKit начало координат внизу.
     private func layoutCards() -> NSSize {
-        let top = hosting.fittingSize
-        let bottom = footer.fittingSize
-        let width = max(top.width, bottom.width)
-        let total = NSSize(width: width, height: top.height + Metrics.cardGap + bottom.height)
+        let sizes = cards.map(\.fittingSize)
+        let width = sizes.map(\.width).max() ?? Metrics.popoverWidth
+        let gaps = Metrics.cardGap * CGFloat(max(cards.count - 1, 0))
+        let total = NSSize(width: width, height: sizes.reduce(gaps) { $0 + $1.height })
+
+        var top = total.height
+        for (card, size) in zip(cards, sizes) {
+            top -= size.height
+            card.frame = NSRect(x: 0, y: top, width: width, height: size.height)
+            top -= Metrics.cardGap
+        }
 
         container.frame = NSRect(origin: .zero, size: total)
-        footer.frame = NSRect(x: 0, y: 0, width: width, height: bottom.height)
-        hosting.frame = NSRect(x: 0, y: bottom.height + Metrics.cardGap, width: width, height: top.height)
         return total
     }
 
@@ -249,6 +257,12 @@ private enum Metrics {
     static let ringGap: CGFloat = 40
     static let ringSectionTop: CGFloat = 26
     static let ringSectionBottom: CGFloat = 26
+
+    // Высота карточки таймера фиксированная: панель считает свой размер один раз
+    // при открытии, и смена состояния таймера не должна её ломать.
+    static let timerCardHeight: CGFloat = 54
+    static let timerProgressHeight: CGFloat = 2
+    static let timerControlSize: CGFloat = 22
 }
 
 // MARK: - Popover
@@ -303,6 +317,104 @@ struct UsagePopover: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Таймер
+
+struct FocusCard: View {
+    @ObservedObject var timer: FocusTimer
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: Metrics.cornerRadius, style: .continuous)
+    }
+
+    private var title: String {
+        switch timer.phase {
+        case .idle: return DurationFormat.compact(timer.duration)
+        case .finished: return "Done"
+        case .running, .paused: return DurationFormat.countdown(timer.remaining)
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .bottomLeading) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.system(size: 17, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(.white.opacity(timer.phase == .idle ? 0.8 : 1))
+                Spacer(minLength: 8)
+                HStack(spacing: 6) { controls }
+            }
+            .padding(.horizontal, Metrics.horizontalPadding)
+            .frame(height: Metrics.timerCardHeight)
+
+            ProgressLine(progress: timer.progress)
+        }
+        .frame(width: Metrics.popoverWidth, height: Metrics.timerCardHeight)
+        .modifier(GlassSurface(shape: shape))
+        .clipShape(shape)
+        .preferredColorScheme(.dark)
+    }
+
+    @ViewBuilder private var controls: some View {
+        switch timer.phase {
+        case .idle:
+            IconButton(symbol: "minus", action: { timer.adjust(up: false) })
+                .disabled(!timer.canDecrease)
+            IconButton(symbol: "plus", action: { timer.adjust(up: true) })
+                .disabled(!timer.canIncrease)
+            IconButton(symbol: "play.fill", action: timer.start)
+        case .running:
+            IconButton(symbol: "pause.fill", action: timer.pause)
+            IconButton(symbol: "xmark", action: timer.reset)
+        case .paused:
+            IconButton(symbol: "play.fill", action: timer.resume)
+            IconButton(symbol: "xmark", action: timer.reset)
+        case .finished:
+            IconButton(symbol: "arrow.counterclockwise", action: timer.start)
+            IconButton(symbol: "xmark", action: timer.reset)
+        }
+    }
+}
+
+/// Заполняется вдоль нижней кромки карточки — сама карточка и есть шкала.
+private struct ProgressLine: View {
+    let progress: Double
+
+    var body: some View {
+        GeometryReader { geometry in
+            Capsule()
+                .fill(Color.white.opacity(0.5))
+                .frame(width: geometry.size.width * progress)
+        }
+        .frame(height: Metrics.timerProgressHeight)
+        .animation(.easeInOut(duration: 0.25), value: progress)
+    }
+}
+
+private struct IconButton: View {
+    let symbol: String
+    let action: () -> Void
+
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var hovering = false
+
+    private var isHighlighted: Bool { hovering && isEnabled }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(.white.opacity(isEnabled ? (hovering ? 1 : 0.75) : 0.25))
+                .frame(width: Metrics.timerControlSize, height: Metrics.timerControlSize)
+                .background(Circle().fill(Color.white.opacity(isHighlighted ? 0.16 : 0.08)))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            withAnimation(.easeInOut(duration: 0.12)) { self.hovering = hovering }
+        }
     }
 }
 
@@ -654,6 +766,28 @@ private struct ProviderUsage: Identifiable {
         case ..<0.85: return Palette.warn
         default: return Palette.critical
         }
+    }
+}
+
+enum DurationFormat {
+    /// Настроенная длительность: «45m», «1h», «1h 30m».
+    static func compact(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds.rounded())
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        if hours == 0 { return "\(minutes)m" }
+        return minutes == 0 ? "\(hours)h" : "\(hours)h \(minutes)m"
+    }
+
+    /// Обратный отсчёт: «1:23:45» или «23:45».
+    static func countdown(_ seconds: TimeInterval) -> String {
+        // Округляем вверх, чтобы «0:01» не висела целую секунду на нуле.
+        let total = max(0, Int(seconds.rounded(.up)))
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 { return String(format: "%d:%02d:%02d", hours, minutes, secs) }
+        return String(format: "%d:%02d", minutes, secs)
     }
 }
 
